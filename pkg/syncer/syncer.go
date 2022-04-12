@@ -35,7 +35,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/rest"
@@ -67,12 +66,12 @@ const SyncDown SyncDirection = "down"
 // SyncUp indicates a syncer watches resources on the target cluster and applies the status to KCP
 const SyncUp SyncDirection = "up"
 
-func StartSyncer(ctx context.Context, upstream, downstream *rest.Config, resources sets.String, kcpClusterName logicalcluster.LogicalCluster, pcluster string, numSyncerThreads int) error {
-	specSyncer, err := NewSpecSyncer(upstream, downstream, resources.List(), kcpClusterName, pcluster)
+func StartSyncer(ctx context.Context, upstream, downstream *rest.Config, resources sets.String, negotiationDomain logicalcluster.LogicalCluster, pcluster string, numSyncerThreads int) error {
+	specSyncer, err := NewSpecSyncer(upstream, downstream, resources.List(), pcluster)
 	if err != nil {
 		return err
 	}
-	statusSyncer, err := NewStatusSyncer(downstream, upstream, resources.List(), kcpClusterName, pcluster)
+	statusSyncer, err := NewStatusSyncer(downstream, upstream, resources.List(), pcluster)
 	if err != nil {
 		return err
 	}
@@ -84,7 +83,7 @@ func StartSyncer(ctx context.Context, upstream, downstream *rest.Config, resourc
 	if err != nil {
 		return err
 	}
-	kcpClient := kcpClusterClient.Cluster(kcpClusterName)
+	kcpClient := kcpClusterClient.Cluster(negotiationDomain)
 	workloadClustersClient := kcpClient.WorkloadV1alpha1().WorkloadClusters()
 
 	// Attempt to heartbeat every interval
@@ -99,14 +98,14 @@ func StartSyncer(ctx context.Context, upstream, downstream *rest.Config, resourc
 			patchBytes := []byte(fmt.Sprintf(`[{"op":"replace","path":"/status/lastSyncerHeartbeatTime","value":%q}]`, time.Now().Format(time.RFC3339)))
 			workloadCluster, err := workloadClustersClient.Patch(ctx, pcluster, types.JSONPatchType, patchBytes, metav1.PatchOptions{}, "status")
 			if err != nil {
-				klog.Errorf("failed to set status.lastSyncerHeartbeatTime for WorkloadCluster %s|%s: %v", kcpClusterName, pcluster, err)
+				klog.Errorf("failed to set status.lastSyncerHeartbeatTime for WorkloadCluster %s|%s: %v", negotiationDomain, pcluster, err)
 				return false, nil
 			}
 			heartbeatTime = workloadCluster.Status.LastSyncerHeartbeatTime.Time
 			return true, nil
 		})
 
-		klog.V(5).Infof("Heartbeat set for WorkloadCluster %s|%s: %s", kcpClusterName, pcluster, heartbeatTime)
+		klog.V(5).Infof("Heartbeat set for WorkloadCluster %s|%s: %s", negotiationDomain, pcluster, heartbeatTime)
 
 	}, heartbeatInterval)
 
@@ -114,7 +113,7 @@ func StartSyncer(ctx context.Context, upstream, downstream *rest.Config, resourc
 }
 
 type mutatorGvrMap map[schema.GroupVersionResource]func(obj *unstructured.Unstructured) error
-type UpsertFunc func(ctx context.Context, gvr schema.GroupVersionResource, namespace string, unstrob *unstructured.Unstructured) error
+type UpsertFunc func(ctx context.Context, gvr schema.GroupVersionResource, namespace string, fromCluster logicalcluster.LogicalCluster, unstrob *unstructured.Unstructured) error
 type DeleteFunc func(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) error
 type HandlersProvider func(c *Controller, gvr schema.GroupVersionResource) cache.ResourceEventHandlerFuncs
 
@@ -123,30 +122,28 @@ type Controller struct {
 	queue workqueue.RateLimitingInterface
 
 	fromInformers dynamicinformer.DynamicSharedInformerFactory
-	toClient      dynamic.Interface
+	toClients     *dynamic.Cluster
 
 	upsertFn  UpsertFunc
 	deleteFn  DeleteFunc
 	direction SyncDirection
 
-	upstreamClusterName logicalcluster.LogicalCluster
-	syncerNamespace     string
-	mutators            mutatorGvrMap
+	syncerNamespace string
+	mutators        mutatorGvrMap
 }
 
 // New returns a new syncer Controller syncing spec from "from" to "to".
-func New(kcpClusterName logicalcluster.LogicalCluster, pcluster string, fromDiscovery discovery.DiscoveryInterface, fromClient, toClient dynamic.Interface, direction SyncDirection, syncedResourceTypes []string, pclusterID string, mutators mutatorGvrMap) (*Controller, error) {
-	controllerName := string(direction) + "--" + kcpClusterName.String() + "--" + pcluster
+func New(pcluster string, fromClients, toClients *dynamic.Cluster, direction SyncDirection, syncedResourceTypes []string, pclusterID string, mutators mutatorGvrMap) (*Controller, error) {
+	controllerName := string(direction) + "--" + pcluster
 	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "kcp-"+controllerName)
 
 	c := Controller{
-		name:                controllerName,
-		queue:               queue,
-		toClient:            toClient,
-		direction:           direction,
-		upstreamClusterName: kcpClusterName,
-		syncerNamespace:     os.Getenv(SyncerNamespaceKey),
-		mutators:            make(mutatorGvrMap),
+		name:            controllerName,
+		queue:           queue,
+		toClients:       toClients,
+		direction:       direction,
+		syncerNamespace: os.Getenv(SyncerNamespaceKey),
+		mutators:        make(mutatorGvrMap),
 	}
 
 	if len(mutators) > 0 {
@@ -160,13 +157,13 @@ func New(kcpClusterName logicalcluster.LogicalCluster, pcluster string, fromDisc
 		c.upsertFn = c.updateStatusInUpstream
 	}
 
-	fromInformers := dynamicinformer.NewFilteredDynamicSharedInformerFactory(fromClient, resyncPeriod, metav1.NamespaceAll, func(o *metav1.ListOptions) {
+	fromInformers := dynamicinformer.NewFilteredDynamicSharedInformerFactory(fromClients.Cluster(logicalcluster.Wildcard), resyncPeriod, metav1.NamespaceAll, func(o *metav1.ListOptions) {
 		o.LabelSelector = fmt.Sprintf("%s=%s", nscontroller.ClusterLabel, pclusterID)
 	})
 
 	// Get all types the upstream API server knows about.
 	// TODO: watch this and learn about new types, or forget about old ones.
-	gvrstrs, err := getAllGVRs(fromDiscovery, syncedResourceTypes...)
+	gvrstrs, err := getAllGVRs(syncedResourceTypes...)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +185,7 @@ func New(kcpClusterName logicalcluster.LogicalCluster, pcluster string, fromDisc
 			},
 			DeleteFunc: func(obj interface{}) { c.AddToQueue(*gvr, obj) },
 		})
-		klog.InfoS("Set up informer", "direction", c.direction, "clusterName", kcpClusterName, "pcluster", pcluster, "gvr", gvr)
+		klog.InfoS("Set up informer", "direction", c.direction, "pcluster", pcluster, "gvr", gvr)
 	}
 
 	c.fromInformers = fromInformers
@@ -196,83 +193,21 @@ func New(kcpClusterName logicalcluster.LogicalCluster, pcluster string, fromDisc
 	return &c, nil
 }
 
-func contains(ss []string, s string) bool {
-	for _, n := range ss {
-		if n == s {
-			return true
-		}
-	}
-	return false
-}
-
-func getAllGVRs(discoveryClient discovery.DiscoveryInterface, resourcesToSync ...string) ([]string, error) {
+func getAllGVRs(resourcesToSync ...string) ([]string, error) {
 	toSyncSet := sets.NewString(resourcesToSync...)
-	willBeSyncedSet := sets.NewString()
-	rs, err := discoveryClient.ServerPreferredResources()
-	if err != nil {
-		if strings.Contains(err.Error(), "unable to retrieve the complete list of server APIs") {
-			// This error may occur when some API resources added from CRDs are not completely ready.
-			// We should just retry without a limit on the number of retries in such a case.
-			//
-			// In fact this might be related to a bug in the changes made on the feature-logical-cluster
-			// Kubernetes branch to support legacy schema resources added as CRDs.
-			// If this is confirmed, this test will be removed when the CRD bug is fixed.
-			return nil, err
-		} else {
-			return nil, err
-		}
-	}
+	willBeSyncedSet := sets.NewString(resourcesToSync...)
 	// TODO(jmprusi): Added ServiceAccounts, Configmaps and Secrets to the default syncing, but we should figure out
 	//                a way to avoid doing that: https://github.com/kcp-dev/kcp/issues/727
 	gvrstrs := []string{"namespaces.v1.", "serviceaccounts.v1.", "configmaps.v1.", "secrets.v1."} // A syncer should always watch namespaces, serviceaccounts, secrets and configmaps.
-	for _, r := range rs {
-		// v1 -> v1.
-		// apps/v1 -> v1.apps
-		// tekton.dev/v1beta1 -> v1beta1.tekton.dev
-		groupVersion, err := schema.ParseGroupVersion(r.GroupVersion)
-		if err != nil {
-			klog.Warningf("Unable to parse GroupVersion %s : %v", r.GroupVersion, err)
-			continue
-		}
-		vr := groupVersion.Version + "." + groupVersion.Group
-		for _, ai := range r.APIResources {
-			var willBeSynced string
-			groupResource := schema.GroupResource{
-				Group:    groupVersion.Group,
-				Resource: ai.Name,
-			}
 
-			if toSyncSet.Has(groupResource.String()) {
-				willBeSynced = groupResource.String()
-			} else if toSyncSet.Has(ai.Name) {
-				willBeSynced = ai.Name
-			} else {
-				// We're not interested in this resource type
-				continue
-			}
-			if strings.Contains(ai.Name, "/") {
-				// foo/status, pods/exec, namespace/finalize, etc.
-				continue
-			}
-			if !ai.Namespaced {
-				// Ignore cluster-scoped things.
-				continue
-			}
-			if !contains(ai.Verbs, "watch") {
-				klog.Infof("resource %s %s is not watchable: %v", vr, ai.Name, ai.Verbs)
-				continue
-			}
-			gvrstrs = append(gvrstrs, fmt.Sprintf("%s.%s", ai.Name, vr))
-			willBeSyncedSet.Insert(willBeSynced)
-		}
-	}
+	// TODO read resource to sync from negotiation domain workspace
 
 	notFoundResourceTypes := toSyncSet.Difference(willBeSyncedSet)
 	if notFoundResourceTypes.Len() != 0 {
 		// Some of the API resources expected to be there are still not published by KCP.
 		// We should just retry without a limit on the number of retries in such a case,
 		// until the corresponding resources are added inside KCP as CRDs and published as API resources.
-		return nil, fmt.Errorf("The following resource types were requested to be synced, but were not found in the KCP logical cluster: %v", notFoundResourceTypes.List())
+		return nil, fmt.Errorf("the following resource types were requested to be synced, but were not found in the KCP logical cluster: %v", notFoundResourceTypes.List())
 	}
 	return gvrstrs, nil
 }
@@ -481,7 +416,7 @@ func (c *Controller) process(ctx context.Context, h holder) error {
 	}
 
 	if c.upsertFn != nil {
-		return c.upsertFn(ctx, h.gvr, toNamespace, unstrob)
+		return c.upsertFn(ctx, h.gvr, toNamespace, h.clusterName, unstrob)
 	}
 
 	return err

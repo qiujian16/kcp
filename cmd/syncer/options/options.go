@@ -29,7 +29,7 @@ import (
 
 type Options struct {
 	FromKubeconfig      string
-	FromClusterName     string
+	NeogiationDomain    string
 	ToKubeconfig        string
 	ToContext           string
 	PclusterID          string
@@ -46,7 +46,7 @@ func NewOptions() *Options {
 
 func (options *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&options.FromKubeconfig, "from-kubeconfig", options.FromKubeconfig, "Kubeconfig file for -from cluster.")
-	fs.StringVar(&options.FromClusterName, "from-cluster", options.FromClusterName, "Name of the -from logical cluster.")
+	fs.StringVar(&options.NeogiationDomain, "neogitation-domain-workspace", options.NeogiationDomain, "Name of negotiation domain workspace.")
 	fs.StringVar(&options.ToKubeconfig, "to-kubeconfig", options.ToKubeconfig, "Kubeconfig file for -to cluster. If not set, the InCluster configuration will be used.")
 	fs.StringVar(&options.ToContext, "to-context", options.ToContext, "Context to use in the Kubeconfig file for -to cluster, instead of the current context.")
 	fs.StringVar(&options.PclusterID, "workload-cluster-name", options.PclusterID,
@@ -61,8 +61,8 @@ func (options *Options) Complete() error {
 }
 
 func (options *Options) Validate() error {
-	if options.FromClusterName == "" {
-		return errors.New("--from-cluster is required")
+	if options.NeogiationDomain == "" {
+		return errors.New("--neogitation-domain-workspace is required")
 	}
 	if options.FromKubeconfig == "" {
 		return errors.New("--from-kubeconfig is required")

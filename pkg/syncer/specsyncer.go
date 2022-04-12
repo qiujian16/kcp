@@ -29,7 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
@@ -66,45 +65,43 @@ func deepEqualApartFromStatus(oldObj, newObj interface{}) bool {
 
 const specSyncerAgent = "kcp#spec-syncer/v0.0.0"
 
-func NewSpecSyncer(from, to *rest.Config, syncedResourceTypes []string, kcpClusterName logicalcluster.LogicalCluster, pclusterID string) (*Controller, error) {
+func NewSpecSyncer(from, to *rest.Config, syncedResourceTypes []string, pclusterID string) (*Controller, error) {
 	from = rest.CopyConfig(from)
 	from.UserAgent = specSyncerAgent
 	to = rest.CopyConfig(to)
 	to.UserAgent = specSyncerAgent
 
-	klog.Infof("Creating spec syncer for clusterName %s to pcluster %s, resources %v", kcpClusterName, pclusterID, syncedResourceTypes)
+	klog.Infof("Creating spec syncer to pcluster %s, resources %v", pclusterID, syncedResourceTypes)
 
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(from)
-	if err != nil {
-		return nil, err
-	}
-	fromDiscovery := discoveryClient.WithCluster(kcpClusterName)
 	fromClients, err := dynamic.NewClusterForConfig(from)
 	if err != nil {
 		return nil, err
 	}
-	fromClient := fromClients.Cluster(kcpClusterName)
-	toClient := dynamic.NewForConfigOrDie(to)
+
+	toClients, err := dynamic.NewClusterForConfig(to)
+	if err != nil {
+		return nil, err
+	}
 
 	// Register the default mutators
 	mutatorsMap := getDefaultMutators(from)
 
-	return New(kcpClusterName, pclusterID, fromDiscovery, fromClient, toClient, SyncDown, syncedResourceTypes, pclusterID, mutatorsMap)
+	return New(pclusterID, fromClients, toClients, SyncDown, syncedResourceTypes, pclusterID, mutatorsMap)
 }
 
 func (c *Controller) deleteFromDownstream(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) error {
 	// TODO: get UID of just-deleted object and pass it as a precondition on this delete.
 	// This would avoid races where an object is deleted and another object with the same name is created immediately after.
 
-	return c.toClient.Resource(gvr).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	return c.toClients.Cluster(logicalcluster.Wildcard).Resource(gvr).Namespace(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 }
 
 const namespaceLocatorAnnotation = "kcp.dev/namespace-locator"
 
 // TODO: This function is there as a quick and dirty implementation of namespace creation.
 //       In fact We should also be getting notifications about namespaces created upstream and be creating downstream equivalents.
-func (c *Controller) ensureDownstreamNamespaceExists(ctx context.Context, downstreamNamespace string, upstreamObj *unstructured.Unstructured) error {
-	namespaces := c.toClient.Resource(schema.GroupVersionResource{
+func (c *Controller) ensureDownstreamNamespaceExists(ctx context.Context, downstreamNamespace string, fromCluster logicalcluster.LogicalCluster, upstreamObj *unstructured.Unstructured) error {
+	namespaces := c.toClients.Cluster(fromCluster).Resource(schema.GroupVersionResource{
 		Group:    "",
 		Version:  "v1",
 		Resource: "namespaces",
@@ -145,13 +142,13 @@ func (c *Controller) ensureDownstreamNamespaceExists(ctx context.Context, downst
 			return err
 		}
 	}
-	klog.Infof("Created downstream namespace %s for upstream namespace %s|%s", downstreamNamespace, c.upstreamClusterName, upstreamObj.GetNamespace())
+	klog.Infof("Created downstream namespace %s for upstream namespace %s|%s", downstreamNamespace, fromCluster, upstreamObj.GetNamespace())
 
 	return nil
 }
 
-func (c *Controller) applyToDownstream(ctx context.Context, gvr schema.GroupVersionResource, downstreamNamespace string, upstreamObj *unstructured.Unstructured) error {
-	if err := c.ensureDownstreamNamespaceExists(ctx, downstreamNamespace, upstreamObj); err != nil {
+func (c *Controller) applyToDownstream(ctx context.Context, gvr schema.GroupVersionResource, downstreamNamespace string, fromCluster logicalcluster.LogicalCluster, upstreamObj *unstructured.Unstructured) error {
+	if err := c.ensureDownstreamNamespaceExists(ctx, downstreamNamespace, fromCluster, upstreamObj); err != nil {
 		return err
 	}
 
@@ -189,7 +186,7 @@ func (c *Controller) applyToDownstream(ctx context.Context, gvr schema.GroupVers
 		return err
 	}
 
-	if _, err := c.toClient.Resource(gvr).Namespace(downstreamNamespace).Patch(ctx, downstreamObj.GetName(), types.ApplyPatchType, data, metav1.PatchOptions{FieldManager: syncerApplyManager, Force: pointer.Bool(true)}); err != nil {
+	if _, err := c.toClients.Cluster(fromCluster).Resource(gvr).Namespace(downstreamNamespace).Patch(ctx, downstreamObj.GetName(), types.ApplyPatchType, data, metav1.PatchOptions{FieldManager: syncerApplyManager, Force: pointer.Bool(true)}); err != nil {
 		klog.Infof("Error upserting %s %s/%s from upstream %s|%s/%s: %v", gvr.Resource, downstreamObj.GetNamespace(), downstreamObj.GetName(), upstreamObj.GetClusterName(), upstreamObj.GetNamespace(), upstreamObj.GetName(), err)
 		return err
 	}

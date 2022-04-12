@@ -25,7 +25,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
@@ -46,32 +45,30 @@ func deepEqualStatus(oldObj, newObj interface{}) bool {
 
 const statusSyncerAgent = "kcp#status-syncer/v0.0.0"
 
-func NewStatusSyncer(from, to *rest.Config, syncedResourceTypes []string, kcpClusterName logicalcluster.LogicalCluster, pclusterID string) (*Controller, error) {
+func NewStatusSyncer(from, to *rest.Config, syncedResourceTypes []string, pclusterID string) (*Controller, error) {
 	from = rest.CopyConfig(from)
 	from.UserAgent = statusSyncerAgent
 	to = rest.CopyConfig(to)
 	to.UserAgent = statusSyncerAgent
 
-	klog.Infof("Creating status syncer for clusterName %s from pcluster %s, resources %v", kcpClusterName, pclusterID, syncedResourceTypes)
+	klog.Infof("Creating status syncer for from pcluster %s, resources %v", pclusterID, syncedResourceTypes)
 
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(from)
+	fromClients, err := dynamic.NewClusterForConfig(from)
 	if err != nil {
 		return nil, err
 	}
-	fromClient := dynamic.NewForConfigOrDie(from)
 	toClients, err := dynamic.NewClusterForConfig(to)
 	if err != nil {
 		return nil, err
 	}
-	toClient := toClients.Cluster(kcpClusterName)
 
 	// Register the default mutators
 	mutatorsMap := getDefaultMutators(from)
 
-	return New(kcpClusterName, pclusterID, discoveryClient, fromClient, toClient, SyncUp, syncedResourceTypes, pclusterID, mutatorsMap)
+	return New(pclusterID, fromClients, toClients, SyncUp, syncedResourceTypes, pclusterID, mutatorsMap)
 }
 
-func (c *Controller) updateStatusInUpstream(ctx context.Context, gvr schema.GroupVersionResource, upstreamNamespace string, downstreamObj *unstructured.Unstructured) error {
+func (c *Controller) updateStatusInUpstream(ctx context.Context, gvr schema.GroupVersionResource, upstreamNamespace string, toCluster logicalcluster.LogicalCluster, downstreamObj *unstructured.Unstructured) error {
 	upstreamObj := downstreamObj.DeepCopy()
 	upstreamObj.SetUID("")
 	upstreamObj.SetResourceVersion("")
@@ -80,7 +77,7 @@ func (c *Controller) updateStatusInUpstream(ctx context.Context, gvr schema.Grou
 	// Run name transformations on upstreamObj
 	transformName(upstreamObj, SyncUp)
 
-	existing, err := c.toClient.Resource(gvr).Namespace(upstreamNamespace).Get(ctx, upstreamObj.GetName(), metav1.GetOptions{})
+	existing, err := c.toClients.Cluster(toCluster).Resource(gvr).Namespace(upstreamNamespace).Get(ctx, upstreamObj.GetName(), metav1.GetOptions{})
 	if err != nil {
 		klog.Errorf("Getting resource %s/%s: %v", upstreamNamespace, upstreamObj.GetName(), err)
 		return err
@@ -97,11 +94,11 @@ func (c *Controller) updateStatusInUpstream(ctx context.Context, gvr schema.Grou
 	//       I believe to remember that we had resources where that happened.
 
 	upstreamObj.SetResourceVersion(existing.GetResourceVersion())
-	if _, err := c.toClient.Resource(gvr).Namespace(upstreamNamespace).UpdateStatus(ctx, upstreamObj, metav1.UpdateOptions{}); err != nil {
-		klog.Errorf("Failed updating status of resource %s|%s/%s from pcluster namespace %s: %v", c.upstreamClusterName, upstreamNamespace, upstreamObj.GetName(), downstreamObj.GetNamespace(), err)
+	if _, err := c.toClients.Cluster(toCluster).Resource(gvr).Namespace(upstreamNamespace).UpdateStatus(ctx, upstreamObj, metav1.UpdateOptions{}); err != nil {
+		klog.Errorf("Failed updating status of resource %s|%s/%s from pcluster namespace %s: %v", toCluster, upstreamNamespace, upstreamObj.GetName(), downstreamObj.GetNamespace(), err)
 		return err
 	}
-	klog.Infof("Updated status of resource %s|%s/%s from pcluster namespace %s", c.upstreamClusterName, upstreamNamespace, upstreamObj.GetName(), downstreamObj.GetNamespace())
+	klog.Infof("Updated status of resource %s|%s/%s from pcluster namespace %s", toCluster, upstreamNamespace, upstreamObj.GetName(), downstreamObj.GetNamespace())
 
 	return nil
 }
